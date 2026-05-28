@@ -179,6 +179,47 @@ These rules exist to prevent the documented failure modes of AI-assisted develop
 
 ---
 
+## No Hardcoded Data — Ever
+
+One of the most common AI coding failures: stub/demo data ships to production because it looked intentional and passed review.
+
+- **NEVER** hardcode data inline in components, routes, or hooks. Components receive data via props or fetch it via an API/query hook.
+- **NEVER** create mock or stub data in production files (`src/`, `app/`, `lib/`). Test fixtures belong in `__tests__/` or `test/fixtures/` only.
+- **NEVER** use placeholder strings that belong in a database: no `"John Doe"`, `"example@email.com"`, `"Demo Company"`, `"Lorem ipsum"` in `src/`.
+- **NEVER** mix seed data with migration files. Migrations are schema only. Data seeding lives in `supabase/seed.sql`.
+- **If real data isn't available yet:** render an empty state + loading skeleton. Hardcoded data is not a valid placeholder — it ships as-is and survives code review because it looks intentional.
+
+```tsx
+// ❌ Wrong — ships to production with fake data
+const clients = [{ id: 1, name: "Acme Corp" }, { id: 2, name: "Demo Client" }]
+
+// ✅ Correct — empty state until real data loads
+const { data: clients, isLoading } = useClients(org_id)
+if (isLoading) return <ClientListSkeleton />
+if (!clients?.length) return <EmptyState message="No clients yet" />
+```
+
+---
+
+## Pre-Commit Checklist
+
+Run through this before every commit that touches components, API routes, database schema, or auth logic:
+
+- [ ] No hardcoded data, placeholder strings, or mock arrays in `src/` files
+- [ ] All new functions under 40 lines — extracted if exceeded
+- [ ] No business logic in `app/` route handlers or React components
+- [ ] No raw DB rows returned from API endpoints — mapped to typed response schemas
+- [ ] No new pattern introduced without checking if one already exists
+- [ ] Every new API route has: happy path + auth failure + invalid input + IDOR test
+- [ ] No secrets, credentials, or UUIDs hardcoded anywhere in staged files
+- [ ] RLS enabled + all 4 policies on any new table with `org_id`
+- [ ] Session helper (`requireOrg()` or equivalent) called first in every new API route
+- [ ] `pnpm type-check` passes — no TypeScript errors
+- [ ] `pnpm lint` passes — no lint errors
+- [ ] At least one test covers the changed code path
+
+---
+
 ## Supabase & Migrations
 
 ```bash
