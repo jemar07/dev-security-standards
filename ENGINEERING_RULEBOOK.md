@@ -270,3 +270,27 @@ git add supabase/migrations/<file>.sql && git commit
    Delete or edit existing migration files
    Modify SECURITY.md
 ```
+
+---
+
+## AI Agent Code Safety
+
+### Slopsquatting — verify before installing
+LLMs hallucinate npm package names. Attackers register those fake names with malicious code ("slopsquatting").
+**Before installing any AI-suggested package:** run `npm view <package-name>` and confirm it exists, has a credible publish history, and the author is who you expect. This applies to every `import` Claude suggests that you don't immediately recognize.
+
+### OWASP Agentic AI — active threat classes in this stack
+The following risks from the OWASP Agentic AI Top 10 (2025) apply directly to Rama OS:
+- Prompt injection via tool results — user-controlled data (notes, comments, documents) coming back through tools can contain injected instructions
+- Excessive agency — AI inheriting service role permissions for a task that only needs read access to one table
+- Unbounded loops — any AI workflow without `max_steps` and `timeout_at` is a denial-of-wallet vector
+
+Full threat model and pre-commit enforcement: `~/Developer/rama-os/docs/ai-architecture/SECURITY_ARCHITECTURE.md`
+Code quality gates and Semgrep rules: `~/Developer/rama-os/docs/ai-architecture/CODE_QUALITY_GATES.md`
+
+### RLS mistakes LLMs make — the three patterns semgrep now catches
+1. **INSERT policy with `USING` instead of `WITH CHECK`** — silently ignored by Postgres, the policy does nothing
+2. **`USING (true)` on a tenant table** — every authenticated user sees every row
+3. **`SECURITY DEFINER` without `SET search_path`** — search path injection vulnerability
+
+All three are now enforced by `.semgrep/rama-rules.yml` in rama-os. Run `semgrep --config .semgrep/rama-rules.yml .` to check manually.

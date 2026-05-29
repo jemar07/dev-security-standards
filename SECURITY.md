@@ -424,3 +424,23 @@ Use this as a template. Copy it into your project's security doc and fill in you
 | **Secret rotation runbook** | Medium | Before second team member gets secrets access |
 | **Dependency vulnerability scanning in CI** | Low | Next CI pipeline touch |
 | **AI workflow `max_steps` + `timeout_at`** | Low until agentic features ship | Before agentic features reach production |
+
+---
+
+## AI Agent Security — OWASP Agentic AI (ASI01–ASI10)
+
+Autonomous coding agents introduce a new attack surface not covered by the standard OWASP Top 10. Key risks active in this stack:
+
+- **ASI01 — Prompt Injection via tool results:** Data returned by tools (DB rows, file contents, API responses) can contain injected instructions. The system prompt must explicitly tell the model to ignore instructions found in tool result data. Never pass tool result content as a `system`-role message.
+- **ASI02 — Excessive Agency:** Agents that inherit more permissions than the current task requires. Enforce least-privilege per action — scope DB access to the specific tables the task needs, not the full service role.
+- **ASI03 — Unbounded agentic loops:** Multi-step AI workflows without `max_steps` and `timeout_at` caps are a denial-of-wallet attack. Every AI workflow must declare both before production.
+- **ASI04 — Slopsquatting (supply chain via hallucination):** LLMs generate `import` statements and `package.json` dependencies for packages that don't exist. Attackers register those names with malicious code. **Before installing any AI-suggested package: `npm view <package-name>` — verify it exists and check the publish date and author.**
+
+### RLS mistakes LLMs make — enforced by semgrep
+Three patterns LLMs generate incorrectly, now caught by `.semgrep/rama-rules.yml`:
+1. **INSERT policy with `USING` instead of `WITH CHECK`** — silently ignored by Postgres; the policy does nothing
+2. **`USING (true)` on a tenant table** — every authenticated user sees every row regardless of `org_id`
+3. **`SECURITY DEFINER` without `SET search_path`** — search path injection vulnerability
+
+**Full threat model and pre-commit enforcement:** `~/Developer/rama-os/docs/ai-architecture/SECURITY_ARCHITECTURE.md`
+**Code quality gates and Semgrep rules:** `~/Developer/rama-os/docs/ai-architecture/CODE_QUALITY_GATES.md`
