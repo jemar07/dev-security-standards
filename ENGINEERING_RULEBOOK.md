@@ -226,13 +226,13 @@ Run through this before every commit that touches components, API routes, databa
 cd <project-root>
 supabase migration new descriptive_name   # creates timestamped migration file
 # edit the file with your SQL
-supabase db push                          # apply to dev (<dev-supabase-ref>)
+git add supabase/migrations/<file>.sql && git commit   # COMMIT FIRST — the file must be in git before the database sees it (see SECURITY.md)
+supabase db push                          # THEN apply to dev (<dev-supabase-ref>)
 
-# Push to prod (<prod-supabase-ref>):
+# Push to prod (<prod-supabase-ref>) — requires explicit approval:
 supabase link --project-ref <prod-supabase-ref>
 supabase db push
 supabase link --project-ref <dev-supabase-ref>   # always re-link to dev after
-git add supabase/migrations/<file>.sql && git commit
 ```
 
 **Doppler is per-project.** `doppler run --` injects only the secrets from the project linked in `.doppler.yaml`. No secrets are shared across projects unless explicitly configured with `--project <other>`.
