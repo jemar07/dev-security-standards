@@ -238,7 +238,15 @@ if [ -d "$MIGRATION_DIR" ]; then
     green "All migration files committed"
   fi
 
-  DRIFT_SCRIPT="$HOME/Developer/rama-shared/scripts/check-migration-drift.sh"
+  # A sibling worktree must validate its own committed migration set. Falling
+  # back to the shared checkout is only for repos that do not own this script.
+  WORKTREE_DRIFT_SCRIPT="$REPO_ROOT/scripts/check-migration-drift.sh"
+  FALLBACK_DRIFT_SCRIPT="$HOME/Developer/rama-shared/scripts/check-migration-drift.sh"
+  if [ -x "$WORKTREE_DRIFT_SCRIPT" ]; then
+    DRIFT_SCRIPT="$WORKTREE_DRIFT_SCRIPT"
+  else
+    DRIFT_SCRIPT="$FALLBACK_DRIFT_SCRIPT"
+  fi
   if [ -x "$DRIFT_SCRIPT" ]; then
     if DRIFT_OUT=$("$DRIFT_SCRIPT" 2>&1); then
       green "No database migration drift"

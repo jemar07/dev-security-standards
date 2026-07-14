@@ -288,6 +288,26 @@ git -C "$drift_clean_repo" add supabase/migrations/20260713000002_fixture.sql
 git -C "$drift_clean_repo" commit -q -m "add clean drift fixture"
 expect_pass "drift exit zero passes" run_check "$drift_clean_repo" HOME="$drift_clean_repo/home"
 
+drift_worktree_repo="$(make_fixture drift-worktree)"
+mkdir -p "$drift_worktree_repo/supabase/migrations" "$drift_worktree_repo/scripts" "$drift_worktree_repo/home/Developer/rama-shared/scripts"
+cat > "$drift_worktree_repo/supabase/migrations/20260713000003_fixture.sql" <<'SQL'
+select 1;
+SQL
+cat > "$drift_worktree_repo/scripts/check-migration-drift.sh" <<'SH'
+#!/usr/bin/env bash
+echo "worktree migration set in sync"
+exit 0
+SH
+cat > "$drift_worktree_repo/home/Developer/rama-shared/scripts/check-migration-drift.sh" <<'SH'
+#!/usr/bin/env bash
+echo "shared checkout must not be used"
+exit 1
+SH
+chmod +x "$drift_worktree_repo/scripts/check-migration-drift.sh" "$drift_worktree_repo/home/Developer/rama-shared/scripts/check-migration-drift.sh"
+git -C "$drift_worktree_repo" add supabase/migrations/20260713000003_fixture.sql scripts/check-migration-drift.sh
+git -C "$drift_worktree_repo" commit -q -m "add worktree drift fixture"
+expect_pass "worktree drift checker takes precedence" run_check "$drift_worktree_repo" HOME="$drift_worktree_repo/home"
+
 missing_base_repo="$(make_fixture missing-base)"
 git -C "$missing_base_repo" update-ref -d refs/remotes/origin/main
 expect_fail_with "missing route-layer base fails closed" "base ref 'origin/main' is unavailable" \
