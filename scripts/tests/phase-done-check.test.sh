@@ -7,6 +7,20 @@ TMP_ROOT="$(mktemp -d)"
 REAL_GIT="$(command -v git)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
+# Real-semgrep toolchain path, used only by the GATE-001 defect-1 regression
+# tests below (finding-level diff-awareness). The rest of this suite runs
+# semgrep as a scripted mock under a deliberately narrow PATH — that's correct
+# for testing scope-computation and output-formatting logic in isolation, but
+# defect 1 is specifically about semgrep's real JSON line-number shape, so
+# those tests need the real binary. Skipped (not failed) if unavailable.
+SEMGREP_AVAILABLE=0
+SEMGREP_BIN_DIR=""
+if command -v semgrep >/dev/null 2>&1; then
+  SEMGREP_AVAILABLE=1
+  SEMGREP_BIN_DIR="$(dirname "$(command -v semgrep)")"
+fi
+SEMGREP_TOOLCHAIN_PATH="$SEMGREP_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+
 PASS_COUNT=0
 
 fail() {
@@ -134,6 +148,40 @@ expect_fail_with() {
   echo "PASS: $name"
 }
 
+# Minimal git-only fixture for the real-semgrep finding-level tests: no fake
+# pnpm/semgrep/git binaries (Gates 1/2/8 just skip — no package.json; Gate 4
+# stays clean — nothing under app/api), just a real repo with a real
+# .semgrep/ rule so real semgrep produces real JSON with real line numbers.
+make_semgrep_fixture() {
+  local name="$1"
+  local repo="$TMP_ROOT/$name"
+  mkdir -p "$repo/.semgrep" "$repo/lib"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email "phase-done-test@example.invalid"
+  git -C "$repo" config user.name "Phase Done Test"
+  cat > "$repo/.semgrep/no-eval.yaml" <<'YAML'
+rules:
+  - id: no-eval
+    languages: [javascript]
+    message: "eval() is dangerous"
+    severity: ERROR
+    pattern: eval(...)
+YAML
+  git -C "$repo" add .semgrep/no-eval.yaml
+  git -C "$repo" commit -q -m "fixture baseline: semgrep rule"
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD
+  echo "$repo"
+}
+
+run_check_real_semgrep() {
+  local repo="$1"
+  shift
+  (
+    cd "$repo"
+    env PATH="$SEMGREP_TOOLCHAIN_PATH" REAL_GIT_PATH="$REAL_GIT" "$@" bash "$CHECK_SCRIPT"
+  )
+}
+
 baseline_repo="$(make_fixture baseline)"
 expect_pass "legacy route debt is baselined" run_check "$baseline_repo"
 baseline_output="$(run_check "$baseline_repo")"
@@ -236,10 +284,209 @@ test_repo="$(make_fixture test-exit)"
 expect_fail_with "test nonzero exit" "Tests failed" \
   run_check "$test_repo" FAIL_TEST=1
 
+# Gate 7 is diff-aware: pre-existing (unchanged) findings must never fail the
+# gate, only NEW findings in files that actually changed vs the review base.
+semgrep_noop_repo="$(make_fixture semgrep-noop)"
+mkdir -p "$semgrep_noop_repo/.semgrep"
+semgrep_noop_output=""
+if ! semgrep_noop_output="$(run_check "$semgrep_noop_repo" FAIL_SEMGREP=1 2>&1)"; then
+  echo "$semgrep_noop_output"
+  fail "semgrep pre-existing findings with zero changed files should still pass"
+fi
+echo "$semgrep_noop_output" | grep -Fq "No changed files in semgrep scope" || {
+  echo "$semgrep_noop_output"
+  fail "semgrep clean-scope pass message missing"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: semgrep ignores pre-existing findings when nothing changed"
+
 semgrep_repo="$(make_fixture semgrep-exit)"
-mkdir -p "$semgrep_repo/.semgrep"
-expect_fail_with "semgrep nonzero exit" "Semgrep violations" \
+mkdir -p "$semgrep_repo/.semgrep" "$semgrep_repo/app/api/semgrep-target"
+cat > "$semgrep_repo/app/api/semgrep-target/route.ts" <<'TS'
+export async function GET() {
+  return client.from('semgrep_target').select('*')
+}
+TS
+git -C "$semgrep_repo" add app/api/semgrep-target/route.ts
+git -C "$semgrep_repo" commit -q -m "add file for semgrep scope test"
+expect_fail_with "semgrep nonzero exit on changed file" "New semgrep findings in changed files" \
   run_check "$semgrep_repo" FAIL_SEMGREP=1
+semgrep_exit_output="$(run_check "$semgrep_repo" FAIL_SEMGREP=1 2>&1 || true)"
+echo "$semgrep_exit_output" | grep -Fq "pre-existing" || {
+  echo "$semgrep_exit_output"
+  fail "semgrep failure output missing informational pre-existing count"
+}
+echo "$semgrep_exit_output" | grep -Fq "semgrep engine unavailable" || {
+  echo "$semgrep_exit_output"
+  fail "semgrep failure output missing raw fallback text when findings aren't JSON-parseable"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: semgrep failure output carries informational count + raw fallback"
+
+semgrep_clean_repo="$(make_fixture semgrep-clean)"
+mkdir -p "$semgrep_clean_repo/.semgrep" "$semgrep_clean_repo/lib/semgrep-clean"
+cat > "$semgrep_clean_repo/lib/semgrep-clean/util.ts" <<'TS'
+export const answer = 42
+TS
+git -C "$semgrep_clean_repo" add lib/semgrep-clean/util.ts
+git -C "$semgrep_clean_repo" commit -q -m "add clean semgrep-scoped file"
+expect_pass "semgrep passes on changed files with no findings" run_check "$semgrep_clean_repo"
+
+# Per-file summary: 25 real new files, each with one real semgrep finding on
+# its one added line, so both the per-file tally and the 20-line cap are
+# exercised against genuine semgrep JSON (path + start.line), not a hand-typed
+# payload. (A hand-typed payload without "start.line" — the previous version
+# of this test — can no longer exercise Gate 7's finding-level filter at all:
+# entries with no line number are correctly dropped as unverifiable, so that
+# payload now trivially passes instead of exercising the cap/summary logic.)
+if [ "$SEMGREP_AVAILABLE" -eq 1 ]; then
+  semgrep_summary_repo="$(make_semgrep_fixture semgrep-summary)"
+  mkdir -p "$semgrep_summary_repo/lib/summary-target"
+  for i in $(seq -w 1 25); do
+    cat > "$semgrep_summary_repo/lib/summary-target/file-$i.js" <<JS
+function risky() { return eval("finding-$i"); }
+JS
+  done
+  git -C "$semgrep_summary_repo" add lib/summary-target
+  git -C "$semgrep_summary_repo" commit -q -m "add 25 new files, each with one new eval finding"
+
+  semgrep_summary_output="$(run_check_real_semgrep "$semgrep_summary_repo" 2>&1 || true)"
+  echo "$semgrep_summary_output" | grep -Eq "lib/summary-target/file-[0-9]+\.js: 1" || {
+    echo "$semgrep_summary_output"
+    fail "semgrep per-file summary did not report a per-file count"
+  }
+  echo "$semgrep_summary_output" | grep -Fq "more file(s) omitted" || {
+    echo "$semgrep_summary_output"
+    fail "semgrep per-file summary did not cap and report an omitted count"
+  }
+  echo "$semgrep_summary_output" | grep -Fq "(25 new / 25 pre-existing)" || {
+    echo "$semgrep_summary_output"
+    fail "semgrep per-file summary did not report the exact new/pre-existing counts"
+  }
+  PASS_COUNT=$((PASS_COUNT + 1))
+  echo "PASS: semgrep per-file summary is capped and counted, not a blind tail"
+else
+  echo "SKIP: semgrep per-file summary cap test (semgrep not installed)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# GATE-001 cycle 2, defect 1 (CRITICAL): Gate 7 must be diff-aware at the
+# FINDING level, not the file level. A branch that merely touches a file
+# already carrying a pre-existing finding — without adding a new one — must
+# PASS. These three tests use REAL semgrep (not the scripted mock above)
+# because the bug and the fix both live in how real semgrep's JSON (path +
+# start.line) gets cross-referenced against added line numbers; a mock can't
+# exercise that shape honestly.
+# ─────────────────────────────────────────────────────────────────────────
+
+if [ "$SEMGREP_AVAILABLE" -eq 1 ]; then
+  # (a) Touching a file with a pre-existing finding, without touching the
+  # violating line, must PASS. This is the exact scenario defect 1 named:
+  # the previous (file-level) implementation re-scanned the whole file's
+  # current content on every touch and reported the untouched pre-existing
+  # eval() as "1 new".
+  semgrep_untouched_repo="$(make_semgrep_fixture semgrep-preexisting-untouched)"
+  cat > "$semgrep_untouched_repo/lib/risky.js" <<'JS'
+function safe() {
+  return 1;
+}
+
+function risky() {
+  return eval("1+1");
+}
+JS
+  git -C "$semgrep_untouched_repo" add lib/risky.js
+  git -C "$semgrep_untouched_repo" commit -q -m "baseline: pre-existing eval finding"
+  git -C "$semgrep_untouched_repo" update-ref refs/remotes/origin/main HEAD
+
+  cat >> "$semgrep_untouched_repo/lib/risky.js" <<'JS'
+
+function unrelatedFeature() {
+  return 42;
+}
+JS
+  git -C "$semgrep_untouched_repo" add lib/risky.js
+  git -C "$semgrep_untouched_repo" commit -q -m "branch: touch the file without touching the violation"
+
+  expect_pass "GATE-001 defect1(a): touching a file with a pre-existing finding, without adding one, passes Gate 7" \
+    run_check_real_semgrep "$semgrep_untouched_repo"
+  semgrep_untouched_output="$(run_check_real_semgrep "$semgrep_untouched_repo" 2>&1)"
+  echo "$semgrep_untouched_output" | grep -Fq "(0 new / 1 pre-existing)" || {
+    echo "$semgrep_untouched_output"
+    fail "GATE-001 defect1(a): expected Gate 7 to report 0 new / 1 pre-existing"
+  }
+  PASS_COUNT=$((PASS_COUNT + 1))
+  echo "PASS: GATE-001 defect1(a) — pre-existing finding in a touched-but-not-modified file does not fail Gate 7"
+
+  # (b) A branch that adds a line which itself introduces a finding must FAIL.
+  # Proves the fix isn't just "never fail" — it still catches real new risk.
+  semgrep_newfinding_repo="$(make_semgrep_fixture semgrep-new-finding)"
+  cat > "$semgrep_newfinding_repo/lib/util.js" <<'JS'
+function safe() {
+  return 1;
+}
+JS
+  git -C "$semgrep_newfinding_repo" add lib/util.js
+  git -C "$semgrep_newfinding_repo" commit -q -m "baseline: clean file"
+  git -C "$semgrep_newfinding_repo" update-ref refs/remotes/origin/main HEAD
+
+  cat >> "$semgrep_newfinding_repo/lib/util.js" <<'JS'
+
+function risky() {
+  return eval("2+2");
+}
+JS
+  git -C "$semgrep_newfinding_repo" add lib/util.js
+  git -C "$semgrep_newfinding_repo" commit -q -m "branch: add a new eval finding"
+
+  expect_fail_with "GATE-001 defect1(b): a newly added line that introduces a finding fails Gate 7" \
+    "New semgrep findings in changed files (1 new" \
+    run_check_real_semgrep "$semgrep_newfinding_repo"
+  semgrep_newfinding_output="$(run_check_real_semgrep "$semgrep_newfinding_repo" 2>&1 || true)"
+  echo "$semgrep_newfinding_output" | grep -Fq "lib/util.js: 1" || {
+    echo "$semgrep_newfinding_output"
+    fail "GATE-001 defect1(b): expected the new finding to be attributed to lib/util.js"
+  }
+  PASS_COUNT=$((PASS_COUNT + 1))
+  echo "PASS: GATE-001 defect1(b) — a newly added line that introduces a finding still fails Gate 7"
+
+  # (c) Mixed file: one pre-existing (untouched) finding plus one genuinely
+  # new finding, both in the SAME file. Must report exactly "1 new" — not 2.
+  # This is the sharpest proof that filtering is happening at the finding
+  # (line) level rather than the file level: the old implementation, on
+  # seeing this file in the changed-files list, would re-scan its entire
+  # current content and count both eval() calls as "new".
+  semgrep_mixed_repo="$(make_semgrep_fixture semgrep-mixed-preexisting-and-new)"
+  cat > "$semgrep_mixed_repo/lib/mixed.js" <<'JS'
+function existingRisky() {
+  return eval("1+1");
+}
+
+function safe() {
+  return 1;
+}
+JS
+  git -C "$semgrep_mixed_repo" add lib/mixed.js
+  git -C "$semgrep_mixed_repo" commit -q -m "baseline: one pre-existing eval finding"
+  git -C "$semgrep_mixed_repo" update-ref refs/remotes/origin/main HEAD
+
+  cat >> "$semgrep_mixed_repo/lib/mixed.js" <<'JS'
+
+function newRisky() {
+  return eval("2+2");
+}
+JS
+  git -C "$semgrep_mixed_repo" add lib/mixed.js
+  git -C "$semgrep_mixed_repo" commit -q -m "branch: add a second, new eval finding to the same file"
+
+  expect_fail_with "GATE-001 defect1(c): mixed file reports only the new finding, not the pre-existing one too" \
+    "New semgrep findings in changed files (1 new / 2 pre-existing)" \
+    run_check_real_semgrep "$semgrep_mixed_repo"
+  PASS_COUNT=$((PASS_COUNT + 1))
+  echo "PASS: GATE-001 defect1(c) — a file with both a pre-existing and a new finding counts exactly 1 new"
+else
+  echo "SKIP: GATE-001 defect1 real-semgrep regression tests (semgrep not installed)"
+fi
 
 drift_repo="$(make_fixture drift-exit)"
 mkdir -p "$drift_repo/supabase/migrations" "$drift_repo/home/Developer/rama-shared/scripts"
@@ -355,6 +602,127 @@ echo "$scan_error_overflow_output" | grep -Fq "2 more scan error(s) omitted" || 
 }
 PASS_COUNT=$((PASS_COUNT + 1))
 echo "PASS: route scan-error output is bounded and counted"
+
+# Gate 2 must never report a real pass for a no-op lint script (e.g. rama-os's
+# `"lint": "echo 'lint disabled...'"` after Next 16 dropped `next lint`) — it
+# has to SKIP, distinctly from a real green pass, and not count toward PASS.
+lint_echo_repo="$(make_fixture lint-echo-noop)"
+cat > "$lint_echo_repo/package.json" <<'JSON'
+{
+  "private": true,
+  "scripts": {
+    "type-check": "fixture",
+    "lint": "echo 'lint disabled — Next 16 dropped next lint'",
+    "test": "fixture"
+  }
+}
+JSON
+lint_echo_output=""
+if ! lint_echo_output="$(run_check "$lint_echo_repo" 2>&1)"; then
+  echo "$lint_echo_output"
+  fail "no-op echo lint script should not fail the overall run"
+fi
+echo "$lint_echo_output" | grep -Fq "⏭️  SKIP — Lint script is a no-op" || {
+  echo "$lint_echo_output"
+  fail "no-op echo lint script did not report a distinct SKIP"
+}
+echo "$lint_echo_output" | grep -Fq "✅ No lint errors" && {
+  echo "$lint_echo_output"
+  fail "no-op echo lint script must not report a real pass"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: no-op echo lint script is SKIP, not PASS"
+
+# Generic detection (not echo-specific): "exit 0" / ":" style no-ops must also
+# be caught — the detector must not be keyed to one repo's exact phrasing.
+lint_exit_noop_repo="$(make_fixture lint-exit-noop)"
+cat > "$lint_exit_noop_repo/package.json" <<'JSON'
+{
+  "private": true,
+  "scripts": {
+    "type-check": "fixture",
+    "lint": "true && exit 0",
+    "test": "fixture"
+  }
+}
+JSON
+lint_exit_noop_output=""
+if ! lint_exit_noop_output="$(run_check "$lint_exit_noop_repo" 2>&1)"; then
+  echo "$lint_exit_noop_output"
+  fail "generic no-op lint script should not fail the overall run"
+fi
+echo "$lint_exit_noop_output" | grep -Fq "⏭️  SKIP — Lint script is a no-op" || {
+  echo "$lint_exit_noop_output"
+  fail "generic no-op lint script did not report a distinct SKIP"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: generic (non-echo) no-op lint script is also detected"
+
+# GATE-001 cycle 2, defect 2 (HIGH): a single-line/minified package.json must
+# be parsed correctly too. The previous grep+sed extractor assumed one
+# "key": "value" pair per line: on a single-line file, grep -m1 returns the
+# WHOLE line (every key on it), and the sed anchor `^[^:]*:` matches up to the
+# FIRST colon in the file (e.g. after "private", not after "lint") — so
+# extraction silently returns the raw unparsed line instead of "true", that
+# raw text doesn't match the no-op detector, and the script falls through to
+# actually invoking `pnpm lint` for real (which for this fixture's real
+# `"lint": "true"` command exits 0) — reporting a false "✅ No lint errors"
+# for what is a pure no-op. Must report SKIP instead.
+lint_minified_repo="$(make_fixture lint-minified-noop)"
+cat > "$lint_minified_repo/package.json" <<'JSON'
+{"private":true,"scripts":{"type-check":"fixture","lint":"true","test":"fixture"}}
+JSON
+lint_minified_output=""
+if ! lint_minified_output="$(run_check "$lint_minified_repo" 2>&1)"; then
+  echo "$lint_minified_output"
+  fail "minified no-op lint script should not fail the overall run"
+fi
+echo "$lint_minified_output" | grep -Fq "⏭️  SKIP — Lint script is a no-op (\"true\")" || {
+  echo "$lint_minified_output"
+  fail "minified no-op lint script did not report a distinct SKIP with the correctly extracted value"
+}
+echo "$lint_minified_output" | grep -Fq "✅ No lint errors" && {
+  echo "$lint_minified_output"
+  fail "minified no-op lint script must not report a real pass (the GATE-001 cycle 2 defect 2 regression)"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: single-line/minified package.json no-op lint script is SKIP, not PASS"
+
+# Same defect, second shape: minified JSON where "lint" is entirely absent —
+# must SKIP as "no script", never fall through to a false pass either.
+lint_minified_absent_repo="$(make_fixture lint-minified-absent)"
+cat > "$lint_minified_absent_repo/package.json" <<'JSON'
+{"private":true,"scripts":{"type-check":"fixture","test":"fixture"}}
+JSON
+lint_minified_absent_output=""
+if ! lint_minified_absent_output="$(run_check "$lint_minified_absent_repo" 2>&1)"; then
+  echo "$lint_minified_absent_output"
+  fail "minified package.json with no lint script should not fail the overall run"
+fi
+echo "$lint_minified_absent_output" | grep -Fq "No lint script in package.json" || {
+  echo "$lint_minified_absent_output"
+  fail "minified package.json with no lint script did not report the correct skip reason"
+}
+echo "$lint_minified_absent_output" | grep -Fq "✅ No lint errors" && {
+  echo "$lint_minified_absent_output"
+  fail "minified package.json with no lint script must not report a real pass"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: single-line/minified package.json with no lint key is skipped, not falsely passed"
+
+# A real linter invocation must still run and still fail loudly on error —
+# this is the existing "lint nonzero exit" fixture (script value "fixture",
+# which is not a no-op), re-asserted here for clarity alongside the new cases.
+lint_real_repo="$(make_fixture lint-real-still-checked)"
+expect_fail_with "real lint script still runs and fails" "Lint errors" \
+  run_check "$lint_real_repo" FAIL_LINT=1
+lint_real_output="$(run_check "$lint_real_repo" 2>&1)"
+echo "$lint_real_output" | grep -Fq "✅ No lint errors" || {
+  echo "$lint_real_output"
+  fail "real lint script should still report a genuine pass when it succeeds"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: real lint scripts are unaffected by no-op detection"
 
 echo ""
 echo "All $PASS_COUNT phase-done regression checks passed."
