@@ -236,10 +236,92 @@ test_repo="$(make_fixture test-exit)"
 expect_fail_with "test nonzero exit" "Tests failed" \
   run_check "$test_repo" FAIL_TEST=1
 
+# Gate 7 is diff-aware: pre-existing (unchanged) findings must never fail the
+# gate, only NEW findings in files that actually changed vs the review base.
+semgrep_noop_repo="$(make_fixture semgrep-noop)"
+mkdir -p "$semgrep_noop_repo/.semgrep"
+semgrep_noop_output=""
+if ! semgrep_noop_output="$(run_check "$semgrep_noop_repo" FAIL_SEMGREP=1 2>&1)"; then
+  echo "$semgrep_noop_output"
+  fail "semgrep pre-existing findings with zero changed files should still pass"
+fi
+echo "$semgrep_noop_output" | grep -Fq "No changed files in semgrep scope" || {
+  echo "$semgrep_noop_output"
+  fail "semgrep clean-scope pass message missing"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: semgrep ignores pre-existing findings when nothing changed"
+
 semgrep_repo="$(make_fixture semgrep-exit)"
-mkdir -p "$semgrep_repo/.semgrep"
-expect_fail_with "semgrep nonzero exit" "Semgrep violations" \
+mkdir -p "$semgrep_repo/.semgrep" "$semgrep_repo/app/api/semgrep-target"
+cat > "$semgrep_repo/app/api/semgrep-target/route.ts" <<'TS'
+export async function GET() {
+  return client.from('semgrep_target').select('*')
+}
+TS
+git -C "$semgrep_repo" add app/api/semgrep-target/route.ts
+git -C "$semgrep_repo" commit -q -m "add file for semgrep scope test"
+expect_fail_with "semgrep nonzero exit on changed file" "New semgrep findings in changed files" \
   run_check "$semgrep_repo" FAIL_SEMGREP=1
+semgrep_exit_output="$(run_check "$semgrep_repo" FAIL_SEMGREP=1 2>&1 || true)"
+echo "$semgrep_exit_output" | grep -Fq "pre-existing" || {
+  echo "$semgrep_exit_output"
+  fail "semgrep failure output missing informational pre-existing count"
+}
+echo "$semgrep_exit_output" | grep -Fq "semgrep engine unavailable" || {
+  echo "$semgrep_exit_output"
+  fail "semgrep failure output missing raw fallback text when findings aren't JSON-parseable"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: semgrep failure output carries informational count + raw fallback"
+
+semgrep_clean_repo="$(make_fixture semgrep-clean)"
+mkdir -p "$semgrep_clean_repo/.semgrep" "$semgrep_clean_repo/lib/semgrep-clean"
+cat > "$semgrep_clean_repo/lib/semgrep-clean/util.ts" <<'TS'
+export const answer = 42
+TS
+git -C "$semgrep_clean_repo" add lib/semgrep-clean/util.ts
+git -C "$semgrep_clean_repo" commit -q -m "add clean semgrep-scoped file"
+expect_pass "semgrep passes on changed files with no findings" run_check "$semgrep_clean_repo"
+
+# Per-file summary: craft a real semgrep --json shaped payload across 25 files
+# so both the per-file tally and the 20-line cap are exercised — this is the
+# fix for the old `tail -20` raw-line truncation that hid the finding shape.
+semgrep_summary_repo="$(make_fixture semgrep-summary)"
+mkdir -p "$semgrep_summary_repo/.semgrep" "$semgrep_summary_repo/app/api/summary-target"
+cat > "$semgrep_summary_repo/app/api/summary-target/route.ts" <<'TS'
+export async function GET() {
+  return client.from('summary_target').select('*')
+}
+TS
+git -C "$semgrep_summary_repo" add app/api/summary-target/route.ts
+git -C "$semgrep_summary_repo" commit -q -m "add summary target file"
+
+{
+  echo '#!/usr/bin/env bash'
+  echo 'if printf "%s\n" "$@" | grep -q -- "--json"; then'
+  echo '  results=""'
+  for i in $(seq 1 25); do
+    printf '  results="$results${results:+,}{\\"check_id\\":\\"rule.fixture\\",\\"path\\":\\"app/api/summary-target/file-%02d.ts\\"}"\n' "$i"
+  done
+  echo '  printf '"'"'{"results":[%s]}'"'"' "$results"'
+  echo '  exit 1'
+  echo 'fi'
+  echo 'exit 1'
+} > "$semgrep_summary_repo/bin/semgrep"
+chmod +x "$semgrep_summary_repo/bin/semgrep"
+
+semgrep_summary_output="$(run_check "$semgrep_summary_repo" 2>&1 || true)"
+echo "$semgrep_summary_output" | grep -Eq "app/api/summary-target/file-[0-9]+\.ts: 1" || {
+  echo "$semgrep_summary_output"
+  fail "semgrep per-file summary did not report a per-file count"
+}
+echo "$semgrep_summary_output" | grep -Fq "more file(s) omitted" || {
+  echo "$semgrep_summary_output"
+  fail "semgrep per-file summary did not cap and report an omitted count"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: semgrep per-file summary is capped and counted, not a blind tail"
 
 drift_repo="$(make_fixture drift-exit)"
 mkdir -p "$drift_repo/supabase/migrations" "$drift_repo/home/Developer/rama-shared/scripts"
@@ -355,6 +437,75 @@ echo "$scan_error_overflow_output" | grep -Fq "2 more scan error(s) omitted" || 
 }
 PASS_COUNT=$((PASS_COUNT + 1))
 echo "PASS: route scan-error output is bounded and counted"
+
+# Gate 2 must never report a real pass for a no-op lint script (e.g. rama-os's
+# `"lint": "echo 'lint disabled...'"` after Next 16 dropped `next lint`) — it
+# has to SKIP, distinctly from a real green pass, and not count toward PASS.
+lint_echo_repo="$(make_fixture lint-echo-noop)"
+cat > "$lint_echo_repo/package.json" <<'JSON'
+{
+  "private": true,
+  "scripts": {
+    "type-check": "fixture",
+    "lint": "echo 'lint disabled — Next 16 dropped next lint'",
+    "test": "fixture"
+  }
+}
+JSON
+lint_echo_output=""
+if ! lint_echo_output="$(run_check "$lint_echo_repo" 2>&1)"; then
+  echo "$lint_echo_output"
+  fail "no-op echo lint script should not fail the overall run"
+fi
+echo "$lint_echo_output" | grep -Fq "⏭️  SKIP — Lint script is a no-op" || {
+  echo "$lint_echo_output"
+  fail "no-op echo lint script did not report a distinct SKIP"
+}
+echo "$lint_echo_output" | grep -Fq "✅ No lint errors" && {
+  echo "$lint_echo_output"
+  fail "no-op echo lint script must not report a real pass"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: no-op echo lint script is SKIP, not PASS"
+
+# Generic detection (not echo-specific): "exit 0" / ":" style no-ops must also
+# be caught — the detector must not be keyed to one repo's exact phrasing.
+lint_exit_noop_repo="$(make_fixture lint-exit-noop)"
+cat > "$lint_exit_noop_repo/package.json" <<'JSON'
+{
+  "private": true,
+  "scripts": {
+    "type-check": "fixture",
+    "lint": "true && exit 0",
+    "test": "fixture"
+  }
+}
+JSON
+lint_exit_noop_output=""
+if ! lint_exit_noop_output="$(run_check "$lint_exit_noop_repo" 2>&1)"; then
+  echo "$lint_exit_noop_output"
+  fail "generic no-op lint script should not fail the overall run"
+fi
+echo "$lint_exit_noop_output" | grep -Fq "⏭️  SKIP — Lint script is a no-op" || {
+  echo "$lint_exit_noop_output"
+  fail "generic no-op lint script did not report a distinct SKIP"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: generic (non-echo) no-op lint script is also detected"
+
+# A real linter invocation must still run and still fail loudly on error —
+# this is the existing "lint nonzero exit" fixture (script value "fixture",
+# which is not a no-op), re-asserted here for clarity alongside the new cases.
+lint_real_repo="$(make_fixture lint-real-still-checked)"
+expect_fail_with "real lint script still runs and fails" "Lint errors" \
+  run_check "$lint_real_repo" FAIL_LINT=1
+lint_real_output="$(run_check "$lint_real_repo" 2>&1)"
+echo "$lint_real_output" | grep -Fq "✅ No lint errors" || {
+  echo "$lint_real_output"
+  fail "real lint script should still report a genuine pass when it succeeds"
+}
+PASS_COUNT=$((PASS_COUNT + 1))
+echo "PASS: real lint scripts are unaffected by no-op detection"
 
 echo ""
 echo "All $PASS_COUNT phase-done regression checks passed."

@@ -27,6 +27,36 @@ green() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 red()   { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 warn()  { echo "  ⚠️  $1"; WARNINGS+=("$1"); }
 skip()  { echo "  ⏭️  $1 — skipped (not applicable)"; }
+noop_skip() { echo "  ⏭️  SKIP — $1"; }
+
+# Generic no-op-script detector: true if every ; / && / || separated segment's
+# first token is a shell builtin that does nothing observable (echo/true/:/exit).
+# Not repo-specific — doesn't name any linter, so it works for any package.json.
+is_noop_script() {
+  local script="$1"
+  [ -z "$script" ] && return 0
+  local segment first_word had_segment=0
+  while IFS= read -r segment; do
+    segment="${segment#"${segment%%[![:space:]]*}"}"
+    segment="${segment%"${segment##*[![:space:]]}"}"
+    [ -z "$segment" ] && continue
+    had_segment=1
+    first_word=$(printf '%s' "$segment" | awk '{print $1}')
+    case "$first_word" in
+      echo|true|:|exit) ;;
+      *) return 1 ;;
+    esac
+  done < <(printf '%s\n' "$script" | sed -E 's/(&&|\|\||;)/\n/g')
+  [ "$had_segment" -eq 1 ] || return 0
+  return 0
+}
+
+# Extracts the string value of a top-level "<key>": "..." entry from package.json.
+extract_package_script() {
+  local pkg="$1" key="$2"
+  grep -m1 "\"$key\"[[:space:]]*:" "$pkg" 2>/dev/null \
+    | sed -E "s/^[^:]*:[[:space:]]*\"(([^\"\\\\]|\\\\.)*)\".*/\\1/"
+}
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -51,7 +81,10 @@ fi
 # ── GATE 2: Lint ──────────────────────────────────────────────────────────────
 echo "Gate 2 — ESLint"
 if [ -f "$REPO_ROOT/package.json" ] && grep -q '"lint"' "$REPO_ROOT/package.json" 2>/dev/null; then
-  if $FIX_MODE; then
+  LINT_SCRIPT_VALUE=$(extract_package_script "$REPO_ROOT/package.json" lint)
+  if is_noop_script "$LINT_SCRIPT_VALUE" || printf '%s' "$LINT_SCRIPT_VALUE" | grep -qi "disabled"; then
+    noop_skip "Lint script is a no-op (\"$LINT_SCRIPT_VALUE\") — cannot verify lint cleanliness. This does NOT count as a pass."
+  elif $FIX_MODE; then
     cd "$REPO_ROOT" && pnpm lint --fix 2>/dev/null \
       && green "Lint clean (auto-fixed where possible)" \
       || red "Lint errors remain after --fix"
@@ -276,14 +309,82 @@ else
   green "Working tree clean"
 fi
 
-# ── GATE 7: Semgrep (repo-local config only) ──────────────────────────────────
+# ── GATE 7: Semgrep (diff-aware — only NEW findings in changed files can fail) ─
 echo "Gate 7 — Semgrep security rules"
 if command -v semgrep >/dev/null 2>&1 && [ -d "$REPO_ROOT/.semgrep" ]; then
-  if SEMGREP_OUT=$(cd "$REPO_ROOT" && semgrep --config .semgrep/ --error --quiet . 2>&1); then
-    green "No semgrep violations"
+  SEMGREP_SCOPE_ERROR=""
+  SEMGREP_BASE_REF="${PHASE_DONE_BASE_REF:-origin/main}"
+
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "${SEMGREP_BASE_REF}^{commit}" >/dev/null 2>&1; then
+    SEMGREP_SCOPE_ERROR="base ref '$SEMGREP_BASE_REF' is unavailable; set PHASE_DONE_BASE_REF to a trusted review base"
   else
-    red "Semgrep violations found:"
-    echo "$SEMGREP_OUT" | grep -v "^$" | tail -20
+    SEMGREP_MERGE_BASE=$(git -C "$REPO_ROOT" merge-base "$SEMGREP_BASE_REF" HEAD 2>/dev/null || true)
+    [ -z "$SEMGREP_MERGE_BASE" ] && SEMGREP_SCOPE_ERROR="merge base with '$SEMGREP_BASE_REF' is unavailable"
+  fi
+
+  if [ -z "$SEMGREP_SCOPE_ERROR" ] && ! SEMGREP_COMMITTED_FILES=$(git -C "$REPO_ROOT" diff --name-only --no-color "$SEMGREP_MERGE_BASE" HEAD 2>&1); then
+    SEMGREP_SCOPE_ERROR="committed file diff failed"
+  fi
+  if [ -z "$SEMGREP_SCOPE_ERROR" ] && ! SEMGREP_STAGED_FILES=$(git -C "$REPO_ROOT" diff --name-only --no-color --cached HEAD 2>&1); then
+    SEMGREP_SCOPE_ERROR="staged file diff failed"
+  fi
+  if [ -z "$SEMGREP_SCOPE_ERROR" ] && ! SEMGREP_UNSTAGED_FILES=$(git -C "$REPO_ROOT" diff --name-only --no-color 2>&1); then
+    SEMGREP_SCOPE_ERROR="unstaged file diff failed"
+  fi
+  if [ -z "$SEMGREP_SCOPE_ERROR" ] && ! SEMGREP_UNTRACKED_FILES=$(git -C "$REPO_ROOT" ls-files --others --exclude-standard 2>&1); then
+    SEMGREP_SCOPE_ERROR="untracked file inventory failed"
+  fi
+
+  if [ -n "$SEMGREP_SCOPE_ERROR" ]; then
+    red "Semgrep diff scope failed closed: $SEMGREP_SCOPE_ERROR"
+  else
+    SEMGREP_CHANGED_FILES=$(printf '%s\n%s\n%s\n%s\n' \
+      "$SEMGREP_COMMITTED_FILES" "$SEMGREP_STAGED_FILES" "$SEMGREP_UNSTAGED_FILES" "$SEMGREP_UNTRACKED_FILES" \
+      | awk 'NF && !seen[$0]++')
+
+    SEMGREP_SCAN_TARGETS=()
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ -f "$REPO_ROOT/$f" ] && SEMGREP_SCAN_TARGETS+=("$f")
+    done <<< "$SEMGREP_CHANGED_FILES"
+
+    # Informational only — the full-repo count is never allowed to fail the gate.
+    SEMGREP_FULL_OUT=$(cd "$REPO_ROOT" && semgrep --config .semgrep/ --error --quiet --json . 2>/dev/null)
+    SEMGREP_FULL_EXIT=$?
+    if [ "$SEMGREP_FULL_EXIT" -eq 0 ] || [ "$SEMGREP_FULL_EXIT" -eq 1 ]; then
+      SEMGREP_FULL_COUNT=$(printf '%s' "$SEMGREP_FULL_OUT" | grep -o '"check_id"' | wc -l | tr -d ' ')
+    else
+      SEMGREP_FULL_COUNT="unavailable"
+    fi
+
+    if [ "${#SEMGREP_SCAN_TARGETS[@]}" -eq 0 ]; then
+      green "No changed files in semgrep scope — clean pass (0 new / $SEMGREP_FULL_COUNT pre-existing)"
+    else
+      SEMGREP_OUT=$(cd "$REPO_ROOT" && semgrep --config .semgrep/ --error --quiet --json "${SEMGREP_SCAN_TARGETS[@]}" 2>&1)
+      SEMGREP_SCAN_EXIT=$?
+      if [ "$SEMGREP_SCAN_EXIT" -eq 0 ]; then
+        green "No new semgrep findings in ${#SEMGREP_SCAN_TARGETS[@]} changed file(s) (0 new / $SEMGREP_FULL_COUNT pre-existing)"
+      else
+        SEMGREP_NEW_COUNT=$(printf '%s' "$SEMGREP_OUT" | grep -o '"check_id"' | wc -l | tr -d ' ')
+        red "New semgrep findings in changed files ($SEMGREP_NEW_COUNT new / $SEMGREP_FULL_COUNT pre-existing):"
+        SEMGREP_PER_FILE=$(printf '%s' "$SEMGREP_OUT" \
+          | grep -o '"path": *"[^"]*"' \
+          | sed -E 's/"path": *"([^"]*)"/\1/' \
+          | sort | uniq -c | sort -rn \
+          | awk '{count=$1; $1=""; sub(/^ /,""); print "     " $0 ": " count}')
+        if [ -n "$SEMGREP_PER_FILE" ]; then
+          echo "$SEMGREP_PER_FILE" | head -20
+          SEMGREP_PER_FILE_LINES=$(echo "$SEMGREP_PER_FILE" | wc -l | tr -d ' ')
+          if [ "$SEMGREP_PER_FILE_LINES" -gt 20 ]; then
+            echo "     ... $((SEMGREP_PER_FILE_LINES - 20)) more file(s) omitted"
+          fi
+        else
+          # Findings couldn't be parsed as semgrep JSON (e.g. an engine-level
+          # error) — fall back to the raw output so nothing is hidden.
+          echo "$SEMGREP_OUT" | grep -v "^$" | head -20
+        fi
+      fi
+    fi
   fi
 elif ! command -v semgrep >/dev/null 2>&1; then
   skip "semgrep not installed (pip install semgrep)"
